@@ -1,0 +1,181 @@
+From 38e1610634739b85e2a2f1fb81194f7261afb061 Mon Sep 17 00:00:00 2001
+From: Mathy Vanhoef <Mathy.Vanhoef@kuleuven.be>
+Date: Tue, 14 Apr 2026 00:42:40 +0200
+Subject: [PATCH] hostap: basic SAE H2E support in MBSS
+
+This was code written using ChatGTP in ordinary chat-bot mode, so rather
+inefficient. Still, the resulting code ended up working.
+
+After this, I switched to Gemini from the terminal. This is kept here
+for documentation and reference.
+
+This was created on top of hostap v2.11
+---
+ wpa_supplicant/mesh.c     | 26 ++++++++++++++++++++++++++
+ wpa_supplicant/mesh.conf  | 13 +++++++++++++
+ wpa_supplicant/mesh1.conf | 14 ++++++++++++++
+ wpa_supplicant/mesh2.conf | 13 +++++++++++++
+ wpa_supplicant/mesh_rsn.c | 34 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 100 insertions(+)
+ create mode 100644 wpa_supplicant/mesh.conf
+ create mode 100644 wpa_supplicant/mesh1.conf
+ create mode 100644 wpa_supplicant/mesh2.conf
+
+diff --git a/wpa_supplicant/mesh.c b/wpa_supplicant/mesh.c
+index 85c1ea8ba..10c803cba 100644
+--- a/wpa_supplicant/mesh.c
++++ b/wpa_supplicant/mesh.c
+@@ -189,6 +189,14 @@ static int wpas_mesh_init_rsn(struct wpa_supplicant *wpa_s)
+ 	bss->conf->wpa = ssid->proto;
+ 	bss->conf->wpa_key_mgmt = ssid->key_mgmt;
+ 
++#ifdef CONFIG_SAE
++	if (ssid->sae_pwe != DEFAULT_SAE_PWE)
++		bss->conf->sae_pwe = ssid->sae_pwe;
++	else
++		bss->conf->sae_pwe = wpa_s->conf->sae_pwe;
++	printf("\n>>> wpas_mesh_init_rsn: sae_pwe=%d\n\n", bss->conf->sae_pwe);
++#endif /* CONFIG_SAE */
++
+ 	if (wpa_s->conf->sae_groups && wpa_s->conf->sae_groups[0] > 0) {
+ 		wpas_mesh_copy_groups(bss, wpa_s);
+ 	} else {
+@@ -201,6 +209,24 @@ static int wpas_mesh_init_rsn(struct wpa_supplicant *wpa_s)
+ 	len = os_strlen(password);
+ 	bss->conf->ssid.wpa_passphrase = dup_binstr(password, len);
+ 
++	if (!bss->conf->ssid.wpa_passphrase)
++		return -1;
++
++#ifdef CONFIG_SAE
++	/*
++	 * Derive PT for the supplicant-side network profile and for the
++	 * internal hostapd-style mesh BSS config after all mesh SAE fields
++	 * are in place.
++	 */
++	wpa_s_setup_sae_pt(wpa_s->conf, ssid, false);
++
++	if (hostapd_setup_sae_pt(bss->conf) < 0) {
++		wpa_printf(MSG_ERROR, "mesh: Failed to derive SAE PT");
++		return -1;
++	}
++#endif /* CONFIG_SAE */
++
++
+ 	wpa_s->mesh_rsn = mesh_rsn_auth_init(wpa_s, ifmsh->mconf);
+ 	return !wpa_s->mesh_rsn ? -1 : 0;
+ }
+diff --git a/wpa_supplicant/mesh.conf b/wpa_supplicant/mesh.conf
+new file mode 100644
+index 000000000..57402113a
+--- /dev/null
++++ b/wpa_supplicant/mesh.conf
+@@ -0,0 +1,13 @@
++sae_groups=21 20 19
++
++# WPA3/SAE: support hash-to-element only so downgrade protection is used
++sae_pwe=1
++
++# secure (SAE + AMPE) network
++network={
++	ssid="secure mesh"
++	mode=5
++	frequency=2437
++	key_mgmt=SAE
++	psk="very secret passphrase"
++}
+diff --git a/wpa_supplicant/mesh1.conf b/wpa_supplicant/mesh1.conf
+new file mode 100644
+index 000000000..b323dc04b
+--- /dev/null
++++ b/wpa_supplicant/mesh1.conf
+@@ -0,0 +1,14 @@
++sae_groups=20
++
++# WPA3/SAE: support hash-to-element only so downgrade protection is used
++sae_pwe=1
++
++# secure (SAE + AMPE) network
++network={
++	ssid="secure mesh"
++	mode=5
++	frequency=2437
++	key_mgmt=SAE
++	psk="very secret passphrase"
++	sae_password="very secret passphrase"
++}
+diff --git a/wpa_supplicant/mesh2.conf b/wpa_supplicant/mesh2.conf
+new file mode 100644
+index 000000000..c9dfe06c8
+--- /dev/null
++++ b/wpa_supplicant/mesh2.conf
+@@ -0,0 +1,13 @@
++sae_groups=19 20
++
++# WPA3/SAE: support hash-to-element only so downgrade protection is used
++sae_pwe=1
++
++# secure (SAE + AMPE) network
++network={
++	ssid="secure mesh"
++	mode=5
++	frequency=2437
++	key_mgmt=SAE
++	psk="very secret passphrase"
++}
+diff --git a/wpa_supplicant/mesh_rsn.c b/wpa_supplicant/mesh_rsn.c
+index ada53c796..f71037058 100644
+--- a/wpa_supplicant/mesh_rsn.c
++++ b/wpa_supplicant/mesh_rsn.c
+@@ -340,7 +340,9 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
+ 				     struct wpa_ssid *ssid,
+ 				     struct sta_info *sta)
+ {
++	struct hostapd_data *hapd = wpa_s->ifmsh->bss[0];
+ 	const char *password;
++	bool use_pt = false;
+ 
+ 	password = ssid->sae_password;
+ 	if (!password)
+@@ -360,6 +362,38 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
+ 		if (!sta->sae->tmp->pw_id)
+ 			return -1;
+ 	}
++
++#ifdef CONFIG_SAE
++	/*
++	 * Same idea as SME: use PT/H2E when configured for H2E-only or
++	 * H2E+HnP, or when a password identifier is present.
++	 */
++	if (hapd->conf->sae_pwe == SAE_PWE_HASH_TO_ELEMENT ||
++	    hapd->conf->sae_pwe == SAE_PWE_BOTH ||
++	    ssid->sae_password_id)
++		use_pt = true;
++
++	if (use_pt) {
++		if (!ssid->pt)
++			wpa_s_setup_sae_pt(wpa_s->conf, ssid, false);
++
++		if (!ssid->pt) {
++			wpa_msg(wpa_s, MSG_DEBUG, "SAE: PT not available");
++			return -1;
++		}
++
++		if (sae_prepare_commit_pt(sta->sae, ssid->pt,
++					  wpa_s->own_addr, sta->addr,
++					  NULL, NULL) < 0) {
++			wpa_msg(wpa_s, MSG_DEBUG,
++				"SAE: Could not prepare commit with PT");
++			return -1;
++		}
++
++		return 0;
++	}
++#endif /* CONFIG_SAE */
++
+ 	return sae_prepare_commit(wpa_s->own_addr, sta->addr,
+ 				  (u8 *) password, os_strlen(password),
+ 				  sta->sae);
+-- 
+2.53.0
+

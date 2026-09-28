@@ -1,0 +1,440 @@
+From a2f1650aa0175866415737091a1bfaa843b1be51 Mon Sep 17 00:00:00 2001
+From: Mathy Vanhoef <Mathy.Vanhoef@kuleuven.be>
+Date: Mon, 13 Apr 2026 21:30:08 +0200
+Subject: [PATCH 2/4] hostap: mesh: SAE group negotation with both unsupported
+ groups
+
+Support SAE group negotiation in a mesh network where both peers do not
+support each other's first group. In this case:
+
+	Supported groups STA1 = 21, 19
+	Supported groups STA2 = 20, 19
+
+With the current code, this results in a seemingly clean execution. So
+at least based on the exchanged frames, this looks like it should.
+---
+ hostap/src/ap/ieee802_11.c       | 70 +++++++++++++++++++-------
+ hostap/src/common/sae.c          | 29 +++++++++--
+ hostap/src/common/sae.h          |  1 +
+ hostap/wpa_supplicant/mesh_rsn.c | 84 +++++++++++++++++++++-----------
+ hostap/wpa_supplicant/mesh_rsn.h |  1 -
+ mesh1.conf                       |  1 +
+ mesh2.conf                       |  1 +
+ 7 files changed, 136 insertions(+), 51 deletions(-)
+
+diff --git a/hostap/src/ap/ieee802_11.c b/hostap/src/ap/ieee802_11.c
+index 6c516bc..7453f03 100644
+--- a/hostap/src/ap/ieee802_11.c
++++ b/hostap/src/ap/ieee802_11.c
+@@ -630,11 +630,16 @@ static struct wpabuf * auth_build_sae_commit(struct hostapd_data *hapd,
+ 
+ 	if (rx_id && hapd->conf->sae_pwe != SAE_PWE_FORCE_HUNT_AND_PECK)
+ 		use_pt = 1;
+-	else if (status_code == WLAN_STATUS_SUCCESS)
+-		use_pt = 0;
+ 	else if (status_code == WLAN_STATUS_SAE_HASH_TO_ELEMENT ||
+ 		 status_code == WLAN_STATUS_SAE_PK)
+ 		use_pt = 1;
++	else if (status_code == WLAN_STATUS_SUCCESS) {
++		if (hapd->conf->sae_pwe == SAE_PWE_HASH_TO_ELEMENT ||
++		    hapd->conf->sae_pwe == SAE_PWE_BOTH)
++			use_pt = 1;
++		else
++			use_pt = 0;
++	}
+ 
+ 	password = sae_get_password(hapd, sta, rx_id, &pw, &pt, &pk);
+ 	if (!password || (use_pt && !pt)) {
+@@ -642,12 +647,13 @@ static struct wpabuf * auth_build_sae_commit(struct hostapd_data *hapd,
+ 		return NULL;
+ 	}
+ 
+-	if (update && use_pt &&
++	if ((update || (hapd->conf->mesh & MESH_ENABLED)) && use_pt &&
+ 	    sae_prepare_commit_pt(sta->sae, pt, own_addr, sta->addr,
+-				  NULL, pk) < 0)
++				  sta->sae->tmp->own_rejected_groups_int,
++				  pk) < 0)
+ 		return NULL;
+ 
+-	if (update && !use_pt &&
++	if ((update || (hapd->conf->mesh & MESH_ENABLED)) && !use_pt &&
+ 	    sae_prepare_commit(own_addr, sta->addr,
+ 			       (u8 *) password, os_strlen(password),
+ 			       sta->sae) < 0) {
+@@ -875,6 +881,9 @@ static void auth_sae_retransmit_timer(void *eloop_ctx, void *eloop_data)
+ 				       hapd->dot11RSNASAERetransPeriod * 1000,
+ 				       auth_sae_retransmit_timer, hapd, sta);
+ 		break;
++	case SAE_NOTHING:
++		wpa_printf(MSG_DEBUG, "SAE: Stop retransmission timer (state Nothing)");
++		return;
+ 	default:
+ 		ret = -1;
+ 		break;
+@@ -1073,17 +1082,13 @@ static int sae_sm_step(struct hostapd_data *hapd, struct sta_info *sta,
+ 			sae_set_retransmit_timer(hapd, sta);
+ 		} else if (hapd->conf->mesh & MESH_ENABLED) {
+ 			/*
+-			 * In mesh case, follow SAE finite state machine and
+-			 * send Commit now, if sync count allows.
++			 * In mesh case, we already sent our commit when moving
++			 * to COMMITTED state (either as initiator or in
++			 * response to peer's commit). Do not send another
++			 * redundant commit here.
+ 			 */
+-			if (sae_check_big_sync(hapd, sta))
+-				return WLAN_STATUS_SUCCESS;
+-			sta->sae->sync++;
+-
+-			ret = auth_sae_send_commit(hapd, sta, 0, status_code);
+-			if (ret)
+-				return ret;
+-
++			wpa_printf(MSG_DEBUG,
++				   "SAE: Already COMMITTED in mesh - skip redundant commit on trans 2");
+ 			sae_set_retransmit_timer(hapd, sta);
+ 		} else {
+ 			/*
+@@ -1194,6 +1199,11 @@ static void sae_pick_next_group(struct hostapd_data *hapd, struct sta_info *sta)
+ 		return;
+ 	}
+ 
++	if (sae->tmp && sae->group > 0) {
++		int_array_add_unique(&sae->tmp->own_rejected_groups_int,
++				     sae->group);
++	}
++
+ 	for (;;) {
+ 		i++;
+ 		if (groups[i] <= 0) {
+@@ -1432,8 +1442,29 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
+ 		    sta->sae->tmp) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "SAE: Peer did not accept our SAE group");
+-			sae_pick_next_group(hapd, sta);
+-			goto remove_sta;
++			if (sta->sae->state == SAE_COMMITTED ||
++			    sta->sae->state == SAE_CONFIRMED) {
++				u16 next_status = status_code;
++				sae_pick_next_group(hapd, sta);
++				if (hapd->conf->sae_pwe == SAE_PWE_HASH_TO_ELEMENT ||
++				    hapd->conf->sae_pwe == SAE_PWE_BOTH)
++					next_status = WLAN_STATUS_SAE_HASH_TO_ELEMENT;
++				resp = auth_sae_send_commit(hapd, sta, 0, next_status);
++				if (resp != WLAN_STATUS_SUCCESS) {
++					wpa_printf(MSG_ERROR,
++						   "SAE: Failed to send commit message");
++					goto remove_sta;
++				}
++				sae_set_state(sta, SAE_COMMITTED,
++					      "Sent Commit (after group rejection in mesh)");
++				sta->sae->sync = 0;
++				sae_set_retransmit_timer(hapd, sta);
++			} else {
++				wpa_printf(MSG_DEBUG,
++					   "SAE: Peer rejected group, but we are in state %s - do not send new commit",
++					   sae_state_txt(sta->sae->state));
++			}
++			return;
+ 		}
+ 
+ 		if (!sae_status_success(hapd, status_code))
+@@ -1468,6 +1499,7 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
+ 			} else {
+ 				sae_set_state(sta, SAE_NOTHING,
+ 					      "Clear existing state to allow restart");
++				sae_clear_retransmit_timer(hapd, sta);
+ 				sae_clear_data(sta->sae);
+ 			}
+ 		}
+@@ -1536,9 +1568,11 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
+ 				sta->sae->group,
+ 				sta->addr, h2e);
+ 			resp = WLAN_STATUS_ANTI_CLOGGING_TOKEN_REQ;
+-			if (hapd->conf->mesh & MESH_ENABLED)
++			if (hapd->conf->mesh & MESH_ENABLED) {
+ 				sae_set_state(sta, SAE_NOTHING,
+ 					      "Request anti-clogging token case in mesh");
++				sae_clear_retransmit_timer(hapd, sta);
++			}
+ 			goto reply;
+ 		}
+ 
+diff --git a/hostap/src/common/sae.c b/hostap/src/common/sae.c
+index a65da61..f3f096f 100644
+--- a/hostap/src/common/sae.c
++++ b/hostap/src/common/sae.c
+@@ -26,6 +26,7 @@
+ int sae_set_group(struct sae_data *sae, int group)
+ {
+ 	struct sae_temporary_data *tmp;
++	int *rejected_groups = NULL;
+ 
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	/* Allow all groups for testing purposes in non-production builds. */
+@@ -36,10 +37,18 @@ int sae_set_group(struct sae_data *sae, int group)
+ 	}
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++	if (sae->tmp) {
++		rejected_groups = sae->tmp->own_rejected_groups_int;
++		sae->tmp->own_rejected_groups_int = NULL;
++	}
++
+ 	sae_clear_data(sae);
+ 	tmp = sae->tmp = os_zalloc(sizeof(*tmp));
+-	if (tmp == NULL)
++	if (tmp == NULL) {
++		os_free(rejected_groups);
+ 		return -1;
++	}
++	tmp->own_rejected_groups_int = rejected_groups;
+ 
+ 	/* First, check if this is an ECC group */
+ 	tmp->ec = crypto_ec_init(group);
+@@ -112,6 +121,7 @@ void sae_clear_temp_data(struct sae_data *sae)
+ 	crypto_ec_point_deinit(tmp->peer_commit_element_ecc, 0);
+ 	wpabuf_free(tmp->anti_clogging_token);
+ 	wpabuf_free(tmp->own_rejected_groups);
++	os_free(tmp->own_rejected_groups_int);
+ 	wpabuf_free(tmp->peer_rejected_groups);
+ 	os_free(tmp->pw_id);
+ 	bin_clear_free(tmp, sizeof(*tmp));
+@@ -1373,7 +1383,7 @@ int sae_prepare_commit_pt(struct sae_data *sae, const struct sae_pt *pt,
+ 			break;
+ 		pt = pt->next;
+ 	}
+-	if (!pt) {
++	if (!pt || (!pt->ec && !pt->dh)) {
+ 		wpa_printf(MSG_INFO, "SAE: Could not find PT for group %u",
+ 			   sae->group);
+ 		return -1;
+@@ -1385,8 +1395,6 @@ int sae_prepare_commit_pt(struct sae_data *sae, const struct sae_pt *pt,
+ 	sae->tmp->ap_pk = pk;
+ #endif /* CONFIG_SAE_PK */
+ 	sae->tmp->own_addr_higher = os_memcmp(addr1, addr2, ETH_ALEN) > 0;
+-	wpabuf_free(sae->tmp->own_rejected_groups);
+-	sae->tmp->own_rejected_groups = NULL;
+ 	if (rejected_groups) {
+ 		int count, i;
+ 		struct wpabuf *groups;
+@@ -1397,6 +1405,7 @@ int sae_prepare_commit_pt(struct sae_data *sae, const struct sae_pt *pt,
+ 			return -1;
+ 		for (i = 0; i < count; i++)
+ 			wpabuf_put_le16(groups, rejected_groups[i]);
++		wpabuf_free(sae->tmp->own_rejected_groups);
+ 		sae->tmp->own_rejected_groups = groups;
+ 	}
+ 
+@@ -1556,6 +1565,18 @@ static int sae_derive_keys(struct sae_data *sae, const u8 *k)
+ 		   sae->h2e, sae->akmp,
+ 		   wpa_akm_to_suite(sae->akmp),
+ 		   wpa_key_mgmt_txt(sae->akmp, WPA_PROTO_RSN));
++	if (sae->h2e && !sae->tmp->own_rejected_groups &&
++	    sae->tmp->own_rejected_groups_int) {
++		int count, i;
++		count = int_array_len(sae->tmp->own_rejected_groups_int);
++		sae->tmp->own_rejected_groups = wpabuf_alloc(count * 2);
++		if (sae->tmp->own_rejected_groups) {
++			for (i = 0; i < count; i++)
++				wpabuf_put_le16(sae->tmp->own_rejected_groups,
++						sae->tmp->own_rejected_groups_int[i]);
++		}
++	}
++
+ 	if (sae->h2e && (sae->tmp->own_rejected_groups ||
+ 			 sae->tmp->peer_rejected_groups)) {
+ 		struct wpabuf *own, *peer;
+diff --git a/hostap/src/common/sae.h b/hostap/src/common/sae.h
+index a353aa8..8f11a10 100644
+--- a/hostap/src/common/sae.h
++++ b/hostap/src/common/sae.h
+@@ -62,6 +62,7 @@ struct sae_temporary_data {
+ 	int vlan_id;
+ 	u8 bssid[ETH_ALEN];
+ 	struct wpabuf *own_rejected_groups;
++	int *own_rejected_groups_int;
+ 	struct wpabuf *peer_rejected_groups;
+ 	unsigned int own_addr_higher:1;
+ 
+diff --git a/hostap/wpa_supplicant/mesh_rsn.c b/hostap/wpa_supplicant/mesh_rsn.c
+index 7a2762a..ae8a524 100644
+--- a/hostap/wpa_supplicant/mesh_rsn.c
++++ b/hostap/wpa_supplicant/mesh_rsn.c
+@@ -40,11 +40,12 @@ void mesh_auth_timer(void *eloop_ctx, void *user_data)
+ 		wpa_printf(MSG_DEBUG, "AUTH: Re-authenticate with " MACSTR
+ 			   " (attempt %d) ",
+ 			   MAC2STR(sta->addr), sta->sae_auth_retry);
+-		wpa_msg(wpa_s, MSG_INFO, MESH_SAE_AUTH_FAILURE "addr=" MACSTR,
+-			MAC2STR(sta->addr));
+ 		if (sta->sae_auth_retry < MESH_AUTH_RETRY) {
+ 			mesh_rsn_auth_sae_sta(wpa_s, sta);
++			sta->sae_auth_retry++;
+ 		} else {
++			wpa_msg(wpa_s, MSG_INFO, MESH_SAE_AUTH_FAILURE "addr=" MACSTR,
++				MAC2STR(sta->addr));
+ 			hapd = wpa_s->ifmsh->bss[0];
+ 
+ 			if (sta->sae_auth_retry > MESH_AUTH_RETRY) {
+@@ -300,45 +301,69 @@ struct mesh_rsn *mesh_rsn_auth_init(struct wpa_supplicant *wpa_s,
+ }
+ 
+ 
+-static int index_within_array(const int *array, int idx)
+-{
+-	int i;
+-
+-	for (i = 0; i < idx; i++) {
+-		if (array[i] == -1)
+-			return 0;
+-	}
+-
+-	return 1;
+-}
+-
+-
+ static int mesh_rsn_sae_group(struct wpa_supplicant *wpa_s,
+-			      struct sae_data *sae)
++			      struct sta_info *sta)
+ {
+ 	int *groups = wpa_s->ifmsh->bss[0]->conf->sae_groups;
++	int i, j;
++	struct sae_data *sae = sta->sae;
+ 
+-	/* Configuration may have changed, so validate current index */
+-	if (!index_within_array(groups, wpa_s->mesh_rsn->sae_group_index))
++	if (!groups)
+ 		return -1;
+ 
+-	for (;;) {
+-		int group = groups[wpa_s->mesh_rsn->sae_group_index];
+-
+-		if (group <= 0)
++	/* Find our current group in the enabled list */
++	for (i = 0; groups[i] > 0; i++) {
++		if (sae->group == groups[i])
+ 			break;
+-		if (sae_set_group(sae, group) == 0) {
+-			wpa_dbg(wpa_s, MSG_DEBUG, "SME: Selected SAE group %d",
+-				sae->group);
++	}
++
++	if (groups[i] > 0) {
++		/* We have a current group, try to pick the next one if it was rejected */
++		bool rejected = false;
++		if (sae->tmp && sae->tmp->own_rejected_groups_int) {
++			for (j = 0; sae->tmp->own_rejected_groups_int[j] > 0; j++) {
++				if (sae->tmp->own_rejected_groups_int[j] == sae->group) {
++					rejected = true;
++					break;
++				}
++			}
++		}
++		if (rejected) {
++			i++;
++		} else {
++			/* Stay on current group if it works */
++			return 0;
++		}
++	} else {
++		/* No group selected yet, start from the first one */
++		i = 0;
++	}
++
++	for (; groups[i] > 0; i++) {
++		bool rejected = false;
++		if (sae->tmp && sae->tmp->own_rejected_groups_int) {
++			for (j = 0; sae->tmp->own_rejected_groups_int[j] > 0; j++) {
++				if (sae->tmp->own_rejected_groups_int[j] == groups[i]) {
++					rejected = true;
++					break;
++				}
++			}
++		}
++		if (rejected)
++			continue;
++
++		if (sae_set_group(sae, groups[i]) == 0) {
++			wpa_dbg(wpa_s, MSG_DEBUG, "SAE: Selected group %d for " MACSTR,
++				sae->group, MAC2STR(sta->addr));
+ 			return 0;
+ 		}
+-		wpa_s->mesh_rsn->sae_group_index++;
+ 	}
+ 
+ 	return -1;
+ }
+ 
+ 
++
+ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
+ 				     struct wpa_ssid *ssid,
+ 				     struct sta_info *sta)
+@@ -353,7 +378,7 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
+ 		return -1;
+ 	}
+ 
+-	if (mesh_rsn_sae_group(wpa_s, sta->sae) < 0) {
++	if (mesh_rsn_sae_group(wpa_s, sta) < 0) {
+ 		wpa_msg(wpa_s, MSG_DEBUG, "SAE: Failed to select group");
+ 		return -1;
+ 	}
+@@ -366,7 +391,9 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
+ 
+ 	if (ssid->pt &&
+ 	    sae_prepare_commit_pt(sta->sae, ssid->pt, wpa_s->own_addr,
+-				  sta->addr, NULL, NULL) == 0)
++				  sta->addr,
++				  sta->sae->tmp->own_rejected_groups_int,
++				  NULL) == 0)
+ 		return 0;
+ 
+ 	return sae_prepare_commit(wpa_s->own_addr, sta->addr,
+@@ -395,6 +422,7 @@ int mesh_rsn_auth_sae_sta(struct wpa_supplicant *wpa_s,
+ 		sta->sae = os_zalloc(sizeof(*sta->sae));
+ 		if (sta->sae == NULL)
+ 			return -1;
++		sae_set_group(sta->sae, wpa_s->ifmsh->bss[0]->conf->sae_groups[0]);
+ 	}
+ 
+ 	pmksa = wpa_auth_pmksa_get(hapd->wpa_auth, sta->addr, NULL);
+diff --git a/hostap/wpa_supplicant/mesh_rsn.h b/hostap/wpa_supplicant/mesh_rsn.h
+index 8775ced..e93c8fb 100644
+--- a/hostap/wpa_supplicant/mesh_rsn.h
++++ b/hostap/wpa_supplicant/mesh_rsn.h
+@@ -23,7 +23,6 @@ struct mesh_rsn {
+ 	size_t igtk_len;
+ #ifdef CONFIG_SAE
+ 	struct wpabuf *sae_token;
+-	int sae_group_index;
+ #endif /* CONFIG_SAE */
+ };
+ 
+diff --git a/mesh1.conf b/mesh1.conf
+index f2360bd..f5cd775 100644
+--- a/mesh1.conf
++++ b/mesh1.conf
+@@ -1,6 +1,7 @@
+ ctrl_interface=/tmp/wpa_supplicant_mesh1
+ user_mpm=1
+ sae_pwe=1
++sae_groups=21 19
+ network={
+     ssid="mesh-h2e-test"
+     mode=5
+diff --git a/mesh2.conf b/mesh2.conf
+index 09d12d4..452b982 100644
+--- a/mesh2.conf
++++ b/mesh2.conf
+@@ -1,6 +1,7 @@
+ ctrl_interface=/tmp/wpa_supplicant_mesh2
+ user_mpm=1
+ sae_pwe=1
++sae_groups=20 19
+ network={
+     ssid="mesh-h2e-test"
+     mode=5
+-- 
+2.53.0
+

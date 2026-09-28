@@ -1,0 +1,134 @@
+From 8806357bb37e0ff392da644738c9d7d535f77ac6 Mon Sep 17 00:00:00 2001
+From: Mathy Vanhoef <Mathy.Vanhoef@kuleuven.be>
+Date: Mon, 13 Apr 2026 04:42:29 +0200
+Subject: [PATCH 1/4] hostap: H2E support in mesh networks
+
+---
+ hostap/wpa_supplicant/mesh.c     | 19 +++++++++++++++++++
+ hostap/wpa_supplicant/mesh_rsn.c |  9 +++++++++
+ mesh1.conf                       | 10 ++++++++++
+ mesh2.conf                       | 10 ++++++++++
+ 4 files changed, 48 insertions(+)
+ create mode 100644 mesh1.conf
+ create mode 100644 mesh2.conf
+
+diff --git a/hostap/wpa_supplicant/mesh.c b/hostap/wpa_supplicant/mesh.c
+index 85c1ea8..bc3ebdb 100644
+--- a/hostap/wpa_supplicant/mesh.c
++++ b/hostap/wpa_supplicant/mesh.c
+@@ -188,6 +188,8 @@ static int wpas_mesh_init_rsn(struct wpa_supplicant *wpa_s)
+ 
+ 	bss->conf->wpa = ssid->proto;
+ 	bss->conf->wpa_key_mgmt = ssid->key_mgmt;
++	bss->conf->sae_pwe = wpa_s->conf->sae_pwe;
++	wpa_s_setup_sae_pt(wpa_s->conf, ssid, false);
+ 
+ 	if (wpa_s->conf->sae_groups && wpa_s->conf->sae_groups[0] > 0) {
+ 		wpas_mesh_copy_groups(bss, wpa_s);
+@@ -198,6 +200,21 @@ static int wpas_mesh_init_rsn(struct wpa_supplicant *wpa_s)
+ 			return -1;
+ 	}
+ 
++	if (wpa_key_mgmt_sae(bss->conf->wpa_key_mgmt) &&
++	    bss->conf->sae_pwe != SAE_PWE_FORCE_HUNT_AND_PECK &&
++	    (bss->conf->sae_pwe != SAE_PWE_HUNT_AND_PECK ||
++	     ssid->sae_password_id ||
++	     wpa_key_mgmt_sae_ext_key(bss->conf->wpa_key_mgmt) ||
++	     sae_pk_valid_password(password))) {
++		bss->conf->ssid.pt = sae_derive_pt(bss->conf->sae_groups,
++						  ssid->ssid, ssid->ssid_len,
++						  (const u8 *) password,
++						  os_strlen(password),
++						  ssid->sae_password_id);
++		if (!bss->conf->ssid.pt)
++			return -1;
++	}
++
+ 	len = os_strlen(password);
+ 	bss->conf->ssid.wpa_passphrase = dup_binstr(password, len);
+ 
+@@ -334,6 +351,7 @@ static int wpa_supplicant_mesh_enable_iface_cb(struct hostapd_iface *ifmsh)
+ 
+ 	bss->conf->start_disabled = 1;
+ 	bss->conf->mesh = MESH_ENABLED;
++	bss->conf->sae_pwe = wpa_s->conf->sae_pwe;
+ 	bss->conf->ap_max_inactivity = wpa_s->conf->mesh_max_inactivity;
+ 
+ 	if (wpa_drv_init_mesh(wpa_s)) {
+@@ -473,6 +491,7 @@ static int wpa_supplicant_mesh_init(struct wpa_supplicant *wpa_s,
+ 	bss->conf = *conf->bss;
+ 	bss->conf->start_disabled = 1;
+ 	bss->conf->mesh = MESH_ENABLED;
++	bss->conf->sae_pwe = wpa_s->conf->sae_pwe;
+ 	bss->conf->ap_max_inactivity = wpa_s->conf->mesh_max_inactivity;
+ 	bss->conf->mesh_fwding = wpa_s->conf->mesh_fwding;
+ 
+diff --git a/hostap/wpa_supplicant/mesh_rsn.c b/hostap/wpa_supplicant/mesh_rsn.c
+index ada53c7..7a2762a 100644
+--- a/hostap/wpa_supplicant/mesh_rsn.c
++++ b/hostap/wpa_supplicant/mesh_rsn.c
+@@ -19,6 +19,8 @@
+ #include "ap/wpa_auth.h"
+ #include "ap/sta_info.h"
+ #include "ap/ieee802_11.h"
++#include "common/sae.h"
++#include "config.h"
+ #include "wpa_supplicant_i.h"
+ #include "driver_i.h"
+ #include "wpas_glue.h"
+@@ -185,6 +187,7 @@ static int __mesh_rsn_auth_init(struct mesh_rsn *rsn, const u8 *addr,
+ 	conf.wpa_group_update_count = 4;
+ 	conf.wpa_pairwise_update_count = 4;
+ 	conf.ieee80211w = ieee80211w;
++	conf.sae_pwe = rsn->wpa_s->conf->sae_pwe;
+ 	if (ieee80211w != NO_MGMT_FRAME_PROTECTION)
+ 		conf.group_mgmt_cipher = rsn->mgmt_group_cipher;
+ #ifdef CONFIG_OCV
+@@ -360,6 +363,12 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
+ 		if (!sta->sae->tmp->pw_id)
+ 			return -1;
+ 	}
++
++	if (ssid->pt &&
++	    sae_prepare_commit_pt(sta->sae, ssid->pt, wpa_s->own_addr,
++				  sta->addr, NULL, NULL) == 0)
++		return 0;
++
+ 	return sae_prepare_commit(wpa_s->own_addr, sta->addr,
+ 				  (u8 *) password, os_strlen(password),
+ 				  sta->sae);
+diff --git a/mesh1.conf b/mesh1.conf
+new file mode 100644
+index 0000000..f2360bd
+--- /dev/null
++++ b/mesh1.conf
+@@ -0,0 +1,10 @@
++ctrl_interface=/tmp/wpa_supplicant_mesh1
++user_mpm=1
++sae_pwe=1
++network={
++    ssid="mesh-h2e-test"
++    mode=5
++    key_mgmt=SAE
++    psk="password123"
++    frequency=2412
++}
+diff --git a/mesh2.conf b/mesh2.conf
+new file mode 100644
+index 0000000..09d12d4
+--- /dev/null
++++ b/mesh2.conf
+@@ -0,0 +1,10 @@
++ctrl_interface=/tmp/wpa_supplicant_mesh2
++user_mpm=1
++sae_pwe=1
++network={
++    ssid="mesh-h2e-test"
++    mode=5
++    key_mgmt=SAE
++    psk="password123"
++    frequency=2412
++}
+-- 
+2.53.0
+
